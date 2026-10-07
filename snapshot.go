@@ -12,8 +12,21 @@ import (
 type Snapshot struct {
 	// Version is the monotonically increasing version number.
 	Version int64 `json:"version"`
+	// PolicyVersion identifies the indexing rules (binary detection, encoding
+	// rules, ...) that produced this snapshot. When the running binary's
+	// CurrentPolicyVersion differs, an incremental update re-evaluates every
+	// unchanged file so its outcome stays identical to a full rebuild.
+	PolicyVersion int `json:"policy_version"`
+	// MaxFileSize is the per-file size limit (Config.MaxFileSize) that was in
+	// effect when this snapshot was produced. It is persisted so that after a
+	// restart an incremental update can still detect a size-limit change and
+	// reprocess exactly the files whose outcome it alters.
+	MaxFileSize int64 `json:"max_file_size,omitempty"`
 	// Files maps relative file paths to their indexing outcome.
 	Files map[string]*FileResult `json:"files"`
+	// Skipped maps relative (or absolute when the path cannot be relativized)
+	// paths that could not even be read or traversed to the cause.
+	Skipped map[string]*SkippedPath `json:"skipped,omitempty"`
 
 	// symbols is the globally sorted symbol table. It is derived from Files
 	// and never persisted.
@@ -153,4 +166,23 @@ func (s *Snapshot) StatusCounts() (ok, degraded, skipped int) {
 		}
 	}
 	return
+}
+
+// SkippedCount returns the number of paths that could not be read or
+// traversed (files recorded separately from FileResult-level skips).
+func (s *Snapshot) SkippedCount() int { return len(s.Skipped) }
+
+// SortedSkipped returns all unreadable/un-traversable path records ordered by
+// path.
+func (s *Snapshot) SortedSkipped() []*SkippedPath {
+	paths := make([]string, 0, len(s.Skipped))
+	for p := range s.Skipped {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	out := make([]*SkippedPath, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, s.Skipped[p])
+	}
+	return out
 }

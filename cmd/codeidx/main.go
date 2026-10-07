@@ -111,6 +111,17 @@ func cmdIndex(args []string) error {
 	if err := idx.Save(indexPath); err != nil {
 		return err
 	}
+	// Degraded/skipped paths are part of normal operation; surface them on
+	// stderr (stdout stays the machine-readable JSON report) so a single
+	// unreadable file is locatable without failing the command.
+	for _, sp := range report.SkippedPaths {
+		kind := "path"
+		if sp.IsDir {
+			kind = "directory"
+		}
+		fmt.Fprintf(os.Stderr, "warning: skipped unreadable %s %s: %s (%s)\n",
+			kind, sp.Path, sp.Reason, sp.ReasonCode)
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(report)
@@ -199,13 +210,21 @@ func cmdStatus(args []string) error {
 	}
 	snap := idx.Snapshot()
 	ok, degraded, skipped := snap.StatusCounts()
+	skippedPaths := snap.SortedSkipped()
+	if skippedPaths == nil {
+		skippedPaths = []*index.SkippedPath{}
+	}
 	out := map[string]any{
-		"version":        snap.Version,
-		"files":          snap.FileCount(),
-		"symbols":        snap.SymbolCount(),
-		"files_ok":       ok,
-		"files_degraded": degraded,
-		"files_skipped":  skipped,
+		"version":          snap.Version,
+		"files":            snap.FileCount(),
+		"symbols":          snap.SymbolCount(),
+		"files_ok":         ok,
+		"files_degraded":   degraded,
+		"files_skipped":    skipped,
+		"paths_unreadable": len(skippedPaths),
+		"skipped_paths":    skippedPaths,
+		"policy_version":   snap.PolicyVersion,
+		"max_file_size":    snap.MaxFileSize,
 	}
 	return printJSON(out)
 }

@@ -16,6 +16,12 @@ const (
 	DefaultIndexDir = ".codeidx"
 	// DefaultIndexFile is the default index file name inside DefaultIndexDir.
 	DefaultIndexFile = "index.json"
+	// CurrentPolicyVersion identifies the built-in indexing rules (binary
+	// detection, encoding rules, ...). Bump it whenever a rule change could
+	// alter a FileResult; an incremental update then re-evaluates every file
+	// whose outcome the new rules could change, so its result matches a full
+	// rebuild under the new binary.
+	CurrentPolicyVersion = 2
 )
 
 // Config controls indexing behaviour.
@@ -63,6 +69,21 @@ func (c *Config) Validate() error {
 		return errors.New("index: config: MaxFileSize must be >= 0")
 	}
 	return nil
+}
+
+// policySignature identifies everything that can affect a FileResult apart
+// from file content: the built-in indexing rules (PolicyVersion) and the
+// result-affecting config values. IgnorePatterns are not part of it because
+// file presence alone already captures ignore changes (a newly ignored file
+// becomes "removed", a newly un-ignored one becomes "added").
+type policySignature struct {
+	PolicyVersion int
+	MaxFileSize   int64
+}
+
+// signature returns the policySignature produced by cfg.
+func (c *Config) signature() policySignature {
+	return policySignature{PolicyVersion: CurrentPolicyVersion, MaxFileSize: c.MaxFileSize}
 }
 
 // matchIgnore reports whether the relative path rel matches any of the

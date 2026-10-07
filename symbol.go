@@ -69,12 +69,55 @@ const (
 	StatusSkipped FileStatus = "skipped"
 )
 
+// ReasonCode is a stable, machine-readable classification of why a path was
+// skipped or a file was parsed in degraded mode. Human-readable details stay in
+// FileResult.Reason / SkippedPath.Reason; code should switch on ReasonCode.
+type ReasonCode string
+
+const (
+	// ReasonNone is set when there is nothing to explain (status ok).
+	ReasonNone ReasonCode = ""
+	// ReasonParseError: the file was parsed but contained syntax errors;
+	// partial symbols were still extracted (status degraded).
+	ReasonParseError ReasonCode = "parse_error"
+	// ReasonTooLarge: the file is larger than Config.MaxFileSize and was not
+	// read (status skipped).
+	ReasonTooLarge ReasonCode = "too_large"
+	// ReasonBinary: the file contains binary (NUL) bytes and is not treated as
+	// source code (status skipped).
+	ReasonBinary ReasonCode = "binary"
+	// ReasonInvalidEncoding: the file is not valid UTF-8 (status skipped).
+	ReasonInvalidEncoding ReasonCode = "invalid_encoding"
+	// ReasonAccessDenied: stat/open/read was denied (permission error) or
+	// otherwise failed with an I/O error (status skipped / walk-time skip).
+	ReasonAccessDenied ReasonCode = "access_denied"
+)
+
+// SkippedPath records a path that could not be indexed during a walk or
+// indexing run — typically an unreadable file or directory. Entries are
+// keyed by path on the snapshot, carry a stable ReasonCode and preserve the
+// underlying error message so the exact cause is locatable.
+type SkippedPath struct {
+	// Path is relative to the workspace root when possible, otherwise
+	// absolute.
+	Path string `json:"path"`
+	// IsDir reports whether the path is a directory whose contents could not
+	// be traversed (every file below it is consequently absent).
+	IsDir bool `json:"is_dir,omitempty"`
+	// ReasonCode is the stable classification of the cause.
+	ReasonCode ReasonCode `json:"reason_code"`
+	// Reason is the human-readable cause, including the underlying error.
+	Reason string `json:"reason"`
+}
+
 // FileResult is the per-file indexing outcome.
 type FileResult struct {
 	// Path is relative to the workspace root.
 	Path string `json:"path"`
 	// Status is ok, degraded or skipped.
 	Status FileStatus `json:"status"`
+	// ReasonCode is the stable, machine-readable cause for non-ok outcomes.
+	ReasonCode ReasonCode `json:"reason_code,omitempty"`
 	// Reason explains degraded/skipped outcomes and is empty for ok files.
 	Reason string `json:"reason,omitempty"`
 	// Fingerprint is used for incremental change detection. It is a content

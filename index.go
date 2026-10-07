@@ -38,8 +38,25 @@ type UpdateReport struct {
 	TotalSymbols int
 	// Degraded is the number of files parsed with errors.
 	Degraded int
-	// Skipped is the number of files skipped.
+	// Skipped is the number of files skipped at the file level (oversized,
+	// binary, bad encoding, unreadable, ...).
 	Skipped int
+	// SkippedPaths lists paths that could not be read or traversed at all
+	// during this run (unreadable files/directories), with a locatable path
+	// and a stable reason code. It never causes the run to fail.
+	SkippedPaths []*SkippedPath
+	// ConfigChanged reports that result-affecting configuration or the
+	// built-in indexing rules changed since the previous committed snapshot.
+	// Affected then includes every file whose outcome the change alters.
+	ConfigChanged bool
+}
+
+// walkResult collects the outcome of a workspace walk.
+type walkResult struct {
+	// paths are the candidate .go files (relative, sorted).
+	paths []string
+	// skipped records paths that could not be read or traversed.
+	skipped []*SkippedPath
 }
 
 // New creates an empty index for cfg.
@@ -74,18 +91,33 @@ func (idx *Index) Update(ctx context.Context) (*UpdateReport, error) {
 }
 
 func (idx *Index) run(ctx context.Context, full bool) (*UpdateReport, error) {
-	paths, err := walkFiles(idx.cfg.Root, idx.cfg.IgnorePatterns)
+	wr, err := walkFiles(idx.cfg.Root, idx.cfg.IgnorePatterns)
 	if err != nil {
 		return nil, fmt.Errorf("index: walk workspace: %w", err)
 	}
 
 	old := idx.current.Load()
 	oldFiles := old.Files
+	sig := idx.cfg.signature()
+	// A config/policy change is only meaningful relative to a previously
+	// committed snapshot; the initial empty build is never flagged.
+	configChanged := !full && old.Version != 0 &&
+		(old.PolicyVersion != sig.PolicyVersion || old.MaxFileSize != sig.MaxFileSize)
 	if full {
 		oldFiles = map[string]*FileResult{}
 	}
 
-	added, modified, removed := diffFiles(idx.cfg.Root, paths, oldFiles)
+	added, modified, removed := diffFiles(idx.cfg.Root, wr.paths, oldFiles, sig, old, configChanged)
+	// Normalize to non-nil slices so JSON reports always show arrays.
+	if added == nil {
+		added = []string{}
+	}
+	if modified == nil {
+		modified = []string{}
+	}
+	if removed == nil {
+		removed = []string{}
+	}
 	changed := make([]string, 0, len(added)+len(modified))
 	changed = append(changed, added...)
 	changed = append(changed, modified...)
@@ -106,21 +138,36 @@ func (idx *Index) run(ctx context.Context, full bool) (*UpdateReport, error) {
 		newFiles[fr.Path] = fr
 	}
 
+	skippedPaths := make(map[string]*SkippedPath, len(wr.skipped))
+	for _, sp := range wr.skipped {
+		skippedPaths[sp.Path] = sp
+	}
+
 	snap := &Snapshot{
-		Version: old.Version + 1,
-		Files:   newFiles,
-		symbols: buildSymbols(newFiles),
+		Version:       old.Version + 1,
+		PolicyVersion: sig.PolicyVersion,
+		MaxFileSize:   sig.MaxFileSize,
+		Files:         newFiles,
+		Skipped:       skippedPaths,
+		symbols:       buildSymbols(newFiles),
 	}
 	idx.current.Store(snap)
 
+	skippedList := wr.skipped
+	if skippedList == nil {
+		skippedList = []*SkippedPath{}
+	}
+
 	report := &UpdateReport{
-		Version:      snap.Version,
-		Added:        added,
-		Modified:     modified,
-		Removed:      removed,
-		Affected:     union(added, modified, removed),
-		TotalFiles:   len(newFiles),
-		TotalSymbols: len(snap.symbols),
+		Version:       snap.Version,
+		Added:         added,
+		Modified:      modified,
+		Removed:       removed,
+		Affected:      union(added, modified, removed),
+		TotalFiles:    len(newFiles),
+		TotalSymbols:  len(snap.symbols),
+		SkippedPaths:  skippedList,
+		ConfigChanged: configChanged,
 	}
 	for _, fr := range newFiles {
 		switch fr.Status {
@@ -167,12 +214,45 @@ func (idx *Index) process(ctx context.Context, rels []string) ([]*FileResult, er
 	return results, nil
 }
 
-// walkFiles collects all .go files under root that are not ignored.
-func walkFiles(root string, ignore []string) ([]string, error) {
-	var paths []string
+// walkFiles collects all .go files under root that are not ignored. A single
+// unreadable path never fails the walk: the path (file or directory) is
+// recorded with a stable reason code in the returned walkResult and traversal
+// continues with the rest of the workspace. Only when root itself cannot be
+// opened at all is an error returned, because then there is nothing to index.
+func walkFiles(root string, ignore []string) (*walkResult, error) {
+	res := &walkResult{}
+	recordSkip := func(path string, isDir bool, err error) {
+		rel := mustRel(root, path)
+		res.skipped = append(res.skipped, &SkippedPath{
+			Path:       rel,
+			IsDir:      isDir,
+			ReasonCode: classifyAccessError(err),
+			Reason:     fmt.Sprintf("%s: %v", accessVerb(isDir), err),
+		})
+	}
+
+	// Fail fast only if the root itself is unusable: WalkDir invokes the
+	// callback with the root error before any other entry.
+	rootInfo, rootErr := os.Lstat(root)
+	if rootErr != nil {
+		return nil, fmt.Errorf("index: open workspace root %q: %w", root, rootErr)
+	}
+	if !rootInfo.IsDir() {
+		return nil, fmt.Errorf("index: workspace root %q is not a directory", root)
+	}
+
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// Could not lstat the entry, or could not read the directory's
+			// contents. SkipDir is only valid/meaningful for directories;
+			// returning it after an entry-level error also safely prunes when
+			// the entry turns out to be a directory.
+			isDir := d != nil && d.IsDir()
+			recordSkip(path, isDir, err)
+			if isDir {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if path != root && matchIgnore(mustRel(root, path), ignore) {
@@ -185,15 +265,24 @@ func walkFiles(root string, ignore []string) ([]string, error) {
 			return nil
 		}
 		if filepath.Ext(rel) == ".go" {
-			paths = append(paths, rel)
+			res.paths = append(res.paths, rel)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(paths)
-	return paths, nil
+	sort.Strings(res.paths)
+	sort.Slice(res.skipped, func(i, j int) bool { return res.skipped[i].Path < res.skipped[j].Path })
+	return res, nil
+}
+
+// accessVerb renders the operation that failed for a skipped path.
+func accessVerb(isDir bool) string {
+	if isDir {
+		return "read directory"
+	}
+	return "stat path"
 }
 
 func mustRel(root, path string) string {
@@ -205,8 +294,12 @@ func mustRel(root, path string) string {
 }
 
 // diffFiles compares the current file list against the previous snapshot and
-// classifies each file as added, modified or removed.
-func diffFiles(root string, paths []string, old map[string]*FileResult) (added, modified, removed []string) {
+// classifies each file as added, modified or removed. In addition, when
+// result-affecting configuration (MaxFileSize) or the built-in indexing
+// rules (PolicyVersion) changed, every unchanged file whose outcome the
+// change can alter is classified as modified, so an incremental update
+// produces exactly the files a full rebuild would under the new settings.
+func diffFiles(root string, paths []string, old map[string]*FileResult, sig policySignature, oldSnap *Snapshot, configChanged bool) (added, modified, removed []string) {
 	seen := make(map[string]struct{}, len(paths))
 	for _, rel := range paths {
 		seen[rel] = struct{}{}
@@ -215,7 +308,11 @@ func diffFiles(root string, paths []string, old map[string]*FileResult) (added, 
 			added = append(added, rel)
 			continue
 		}
-		if !unchanged(root, rel, oldFR) {
+		if contentModified(root, rel, oldFR) {
+			modified = append(modified, rel)
+			continue
+		}
+		if configChanged && policyAffects(oldFR, sig, oldSnap) {
 			modified = append(modified, rel)
 		}
 	}
@@ -230,23 +327,58 @@ func diffFiles(root string, paths []string, old map[string]*FileResult) (added, 
 	return
 }
 
-// unchanged reports whether rel is unchanged compared to fr. It first uses
-// the cheap size/mtime check and only hashes content when that check is
-// inconclusive (e.g. the file was touched but not modified).
-func unchanged(root, rel string, fr *FileResult) bool {
+// contentModified reports whether rel's content changed relative to fr. It
+// first uses the cheap size/mtime check and only hashes content when that
+// check is inconclusive (e.g. the file was touched but not modified).
+func contentModified(root, rel string, fr *FileResult) bool {
 	info, err := os.Stat(absPath(root, rel))
 	if err != nil {
-		return false
+		return true
 	}
 	if info.Size() != fr.Size || info.ModTime().UnixNano() != fr.ModTime {
 		// Size or mtime changed: confirm with a content hash.
 		data, err := os.ReadFile(absPath(root, rel))
 		if err != nil {
+			return true
+		}
+		return hashBytes(data) != fr.Fingerprint
+	}
+	return false
+}
+
+// policyAffects reports whether an unchanged file's result would differ
+// between the old snapshot (produced under oldSnap.PolicyVersion /
+// oldSnap.MaxFileSize) and the current policy sig.
+func policyAffects(oldFR *FileResult, sig policySignature, oldSnap *Snapshot) bool {
+	rulesChanged := oldSnap.PolicyVersion != sig.PolicyVersion
+	limitChanged := oldSnap.MaxFileSize != sig.MaxFileSize
+
+	if rulesChanged {
+		// A rules upgrade is a rare, one-time event. For exact equivalence
+		// with a full rebuild we reprocess every unchanged file, except files
+		// whose disposition is and remains "too large": that decision is
+		// rule-independent (a pure size comparison against the already
+		// recorded size) and reprocessing it would mean reading a potentially
+		// huge file for no change. Every other file is reprocessed with no
+		// extra probing. Once the new snapshot is stamped with the new
+		// PolicyVersion, later runs take the cheap content-only fast path.
+		if oldFR.ReasonCode == ReasonTooLarge &&
+			sig.MaxFileSize > 0 && oldFR.Size > sig.MaxFileSize {
 			return false
 		}
-		return hashBytes(data) == fr.Fingerprint
+		return true
 	}
-	return true
+
+	if limitChanged {
+		// Only the size limit changed; binary/encoding/parse outcomes are
+		// size-independent. A file is affected exactly when its size-limit
+		// disposition differs between old and new.
+		tooLargeNow := sig.MaxFileSize > 0 && oldFR.Size > sig.MaxFileSize
+		wasTooLarge := oldFR.ReasonCode == ReasonTooLarge
+		return tooLargeNow != wasTooLarge
+	}
+
+	return false
 }
 
 // union returns the sorted union of the given string slices.

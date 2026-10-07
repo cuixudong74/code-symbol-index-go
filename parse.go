@@ -1,12 +1,15 @@
 package index
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"unicode/utf8"
@@ -21,13 +24,14 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 
 	info, err := os.Stat(abs)
 	if err != nil {
-		return skip(fr, "stat error: %v", err)
+		return skip(fr, ReasonAccessDenied, "stat error: %v", err)
 	}
 	fr.Size = info.Size()
 	fr.ModTime = info.ModTime().UnixNano()
 
 	if maxFileSize > 0 && info.Size() > maxFileSize {
 		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonTooLarge
 		fr.Reason = fmt.Sprintf("file too large: %d bytes exceeds limit %d", info.Size(), maxFileSize)
 		fr.Fingerprint = statFingerprint(info.Size(), info.ModTime().UnixNano())
 		return fr
@@ -35,20 +39,32 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		return skip(fr, "read error: %v", err)
+		return skip(fr, ReasonAccessDenied, "read error: %v", err)
+	}
+	fr.Fingerprint = hashBytes(data)
+
+	// Binary files (compiled artifacts, images, object files, ...) are never
+	// source code. The check runs before UTF-8 validation: a binary that is
+	// also non-UTF-8 is reported as binary, the more specific and actionable
+	// cause. A single NUL byte anywhere is definitive for text sources.
+	if isBinaryData(data) {
+		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonBinary
+		fr.Reason = "binary file: NUL byte detected; not a text source file"
+		return fr
 	}
 	if !utf8.Valid(data) {
 		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonInvalidEncoding
 		fr.Reason = "invalid UTF-8 encoding"
-		fr.Fingerprint = hashBytes(data)
 		return fr
 	}
-	fr.Fingerprint = hashBytes(data)
 
 	fset := token.NewFileSet()
 	file, perr := parser.ParseFile(fset, rel, data, parser.ParseComments)
 	if perr != nil {
 		fr.Status = StatusDegraded
+		fr.ReasonCode = ReasonParseError
 		fr.Reason = fmt.Sprintf("parse error: %v", perr)
 	}
 	if file == nil {
@@ -58,8 +74,30 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 	return fr
 }
 
-func skip(fr *FileResult, format string, args ...any) *FileResult {
+// isBinaryData reports whether data contains a NUL byte, an unambiguous sign
+// that the content is binary rather than UTF-8 text.
+func isBinaryData(data []byte) bool {
+	return bytes.IndexByte(data, 0) >= 0
+}
+
+// classifyAccessError maps an I/O error encountered while reading a path to
+// the stable access reason code. Permission errors and every other
+// unreadable-path I/O error map to access_denied: from the indexer's point of
+// view the path simply cannot be read, while the wrapped message preserves
+// the precise cause (permission denied, no such file, I/O error, ...).
+func classifyAccessError(err error) ReasonCode {
+	if err == nil {
+		return ReasonNone
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return ReasonAccessDenied
+	}
+	return ReasonAccessDenied
+}
+
+func skip(fr *FileResult, code ReasonCode, format string, args ...any) *FileResult {
 	fr.Status = StatusSkipped
+	fr.ReasonCode = code
 	fr.Reason = fmt.Sprintf(format, args...)
 	return fr
 }

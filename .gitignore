@@ -1,0 +1,12 @@
+# Build artifacts (never commit compiled binaries).
+/codeidx
+/cmd/codeidx/codeidx
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Default local index directory.
+/.codeidx/
