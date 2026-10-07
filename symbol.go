@@ -3,6 +3,8 @@
 // fault-tolerant parsing.
 package index
 
+import "os"
+
 // Kind is the kind of a symbol.
 type Kind string
 
@@ -65,9 +67,46 @@ const (
 	// partial symbols were extracted and Reason describes the error.
 	StatusDegraded FileStatus = "degraded"
 	// StatusSkipped means the file was not indexed (oversized, bad encoding,
-	// read error, ...). Reason distinguishes the cause.
+	// read error, ...). ReasonCode distinguishes the cause programmatically and
+	// Reason contains a human-readable description.
 	StatusSkipped FileStatus = "skipped"
 )
+
+// ReasonCode is a stable, machine-readable classification of why a file was
+// skipped or degraded (or why a path could not be traversed). Unlike the
+// free-text Reason field, reason codes are part of the API contract and callers
+// may switch on them.
+type ReasonCode string
+
+const (
+	// ReasonParseError: the file contained Go syntax errors; partial symbols
+	// were still extracted (status degraded).
+	ReasonParseError ReasonCode = "parse_error"
+	// ReasonTooLarge: the file is larger than Config.MaxFileSize and was not
+	// read.
+	ReasonTooLarge ReasonCode = "too_large"
+	// ReasonInvalidUTF8: the file bytes are not valid UTF-8.
+	ReasonInvalidUTF8 ReasonCode = "invalid_utf8"
+	// ReasonBinary: the file contains NUL bytes and is treated as binary data
+	// rather than source code, regardless of its extension.
+	ReasonBinary ReasonCode = "binary"
+	// ReasonPermissionDenied: the path exists but the process lacks permission
+	// to stat, traverse or read it.
+	ReasonPermissionDenied ReasonCode = "permission_denied"
+	// ReasonNotReadable: the path could not be stat/read for an I/O reason
+	// other than permission (e.g. a dangling symlink or an I/O error).
+	ReasonNotReadable ReasonCode = "not_readable"
+)
+
+// classifyOSError maps an os-level error to a stable ReasonCode. Permission
+// errors are reported as ReasonPermissionDenied, everything else as
+// ReasonNotReadable.
+func classifyOSError(err error) ReasonCode {
+	if os.IsPermission(err) {
+		return ReasonPermissionDenied
+	}
+	return ReasonNotReadable
+}
 
 // FileResult is the per-file indexing outcome.
 type FileResult struct {
@@ -75,6 +114,9 @@ type FileResult struct {
 	Path string `json:"path"`
 	// Status is ok, degraded or skipped.
 	Status FileStatus `json:"status"`
+	// ReasonCode is the stable, machine-readable classification of a
+	// degraded/skipped outcome and is empty for ok files.
+	ReasonCode ReasonCode `json:"reason_code,omitempty"`
 	// Reason explains degraded/skipped outcomes and is empty for ok files.
 	Reason string `json:"reason,omitempty"`
 	// Fingerprint is used for incremental change detection. It is a content

@@ -14,6 +14,13 @@ type Snapshot struct {
 	Version int64 `json:"version"`
 	// Files maps relative file paths to their indexing outcome.
 	Files map[string]*FileResult `json:"files"`
+	// SettingsSig is the signature of the indexing settings that produced this
+	// snapshot (see Config.Signature). It lets incremental updates detect when
+	// result-affecting configuration (such as MaxFileSize or IgnorePatterns)
+	// changed. The empty string means the snapshot predates setting signatures
+	// (e.g. an on-disk index written by an older version); the first update
+	// treats that as a settings change and reprocesses every file.
+	SettingsSig string `json:"settings_sig,omitempty"`
 
 	// symbols is the globally sorted symbol table. It is derived from Files
 	// and never persisted.

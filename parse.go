@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -21,13 +22,14 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 
 	info, err := os.Stat(abs)
 	if err != nil {
-		return skip(fr, "stat error: %v", err)
+		return skip(fr, classifyOSError(err), "stat error: %v", err)
 	}
 	fr.Size = info.Size()
 	fr.ModTime = info.ModTime().UnixNano()
 
 	if maxFileSize > 0 && info.Size() > maxFileSize {
 		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonTooLarge
 		fr.Reason = fmt.Sprintf("file too large: %d bytes exceeds limit %d", info.Size(), maxFileSize)
 		fr.Fingerprint = statFingerprint(info.Size(), info.ModTime().UnixNano())
 		return fr
@@ -35,10 +37,18 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		return skip(fr, "read error: %v", err)
+		return skip(fr, classifyOSError(err), "read error: %v", err)
+	}
+	if isBinary(data) {
+		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonBinary
+		fr.Reason = "binary file: NUL byte detected; binary content is not indexed as source"
+		fr.Fingerprint = hashBytes(data)
+		return fr
 	}
 	if !utf8.Valid(data) {
 		fr.Status = StatusSkipped
+		fr.ReasonCode = ReasonInvalidUTF8
 		fr.Reason = "invalid UTF-8 encoding"
 		fr.Fingerprint = hashBytes(data)
 		return fr
@@ -49,6 +59,7 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 	file, perr := parser.ParseFile(fset, rel, data, parser.ParseComments)
 	if perr != nil {
 		fr.Status = StatusDegraded
+		fr.ReasonCode = ReasonParseError
 		fr.Reason = fmt.Sprintf("parse error: %v", perr)
 	}
 	if file == nil {
@@ -58,8 +69,24 @@ func indexFile(rel, abs string, maxFileSize int64) *FileResult {
 	return fr
 }
 
-func skip(fr *FileResult, format string, args ...any) *FileResult {
+// binarySniffBytes is how much of a file is inspected for binary content.
+const binarySniffBytes = 8192
+
+// isBinary reports whether data should be treated as binary rather than text
+// source code. The heuristic is git-compatible: a NUL byte within the first
+// 8 KiB means binary. Only a small prefix is inspected, so multi-megabyte files
+// cost O(8 KiB) instead of a full scan.
+func isBinary(data []byte) bool {
+	n := len(data)
+	if n > binarySniffBytes {
+		n = binarySniffBytes
+	}
+	return bytes.IndexByte(data[:n], 0) >= 0
+}
+
+func skip(fr *FileResult, code ReasonCode, format string, args ...any) *FileResult {
 	fr.Status = StatusSkipped
+	fr.ReasonCode = code
 	fr.Reason = fmt.Sprintf(format, args...)
 	return fr
 }

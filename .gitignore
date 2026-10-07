@@ -1,0 +1,16 @@
+# Build artifacts: binaries produced by `go build`
+# (CLI source lives at cmd/codeidx/main.go; never commit the compiled output)
+/cmd/codeidx/codeidx
+codeidx
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.txt
+
+# Local index data
+/.codeidx/

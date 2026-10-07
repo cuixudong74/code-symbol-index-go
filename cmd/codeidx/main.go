@@ -108,6 +108,12 @@ func cmdIndex(args []string) error {
 	if err != nil {
 		return err
 	}
+	if report.ConfigChanged {
+		fmt.Fprintln(os.Stderr, "warning: indexing configuration changed; all files were re-evaluated under the new settings")
+	}
+	for _, is := range report.Issues {
+		fmt.Fprintf(os.Stderr, "warning: %s %s skipped (%s): %s\n", is.Scope, is.Path, is.ReasonCode, is.Reason)
+	}
 	if err := idx.Save(indexPath); err != nil {
 		return err
 	}

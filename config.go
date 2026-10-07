@@ -1,9 +1,13 @@
 package index
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -63,6 +67,29 @@ func (c *Config) Validate() error {
 		return errors.New("index: config: MaxFileSize must be >= 0")
 	}
 	return nil
+}
+
+// Signature returns a stable, opaque signature of the result-affecting
+// settings: MaxFileSize and IgnorePatterns (Root and Concurrency do not change
+// indexing results and are deliberately excluded). Patterns are trimmed and
+// sorted before hashing so that ordering or incidental whitespace differences
+// do not count as a change. Two configurations with equal signatures produce
+// identical indexing results for identical file contents.
+func (c *Config) Signature() string {
+	patterns := make([]string, 0, len(c.IgnorePatterns))
+	for _, p := range c.IgnorePatterns {
+		if p = strings.TrimSpace(p); p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+	sort.Strings(patterns)
+
+	h := sha256.New()
+	fmt.Fprintf(h, "max=%d\n", c.MaxFileSize)
+	for _, p := range patterns {
+		fmt.Fprintf(h, "ignore=%s\n", filepath.ToSlash(p))
+	}
+	return "cfg:" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // matchIgnore reports whether the relative path rel matches any of the
